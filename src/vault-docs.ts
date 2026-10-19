@@ -8,16 +8,12 @@ type: dashboard
 ---
 # X Bookmarks
 
-Everything saved on X, one note per post. The importer regenerates these notes; your own
-edits below the frontmatter are never overwritten.
+One note per bookmarked post, filed in \`Library/<year>/\`. Views below are live queries over
+the notes — nothing here needs to be maintained by hand.
 
-## Read next
+## Recently saved
 
-![[Inbox.base#Reading queue]]
-
-## Untriaged
-
-![[Inbox.base#Untriaged]]
+![[Library.base#Recent]]
 
 ## Library
 
@@ -26,6 +22,14 @@ edits below the frontmatter are never overwritten.
 ## Who you save from
 
 ![[Authors.base#By author]]
+
+## By topic
+
+![[Topics.base#Kept by year]]
+
+## Waiting to be triaged
+
+![[Inbox.base#Untriaged]]
 `;
 
 export const AGENTS_NOTE = `# X Bookmarks Vault — Agent Instructions
@@ -35,9 +39,10 @@ the importer owns \`data/bookmarks.db\` and rewrites notes from it.
 
 ## Layout
 
-- \`Inbox/\` — imported, not yet triaged. Only the importer adds files here.
-- \`Library/\` — triaged notes. Moving a note here is the triage step.
-- \`Authors/@handle.md\` — generated index per author. **Never hand-edit**; regenerated on every run.
+- \`Library/<year>/\` — triaged notes. This is where everything normally lives.
+- \`Inbox/\` — imported, not yet triaged. Empty once you have worked through a batch.
+- \`Authors/@handle.md\` — generated index per author, only for authors you saved from
+  more than once (\`authorIndexMinPosts\`). **Never hand-edit**; regenerated on every run.
 - \`Bases/\` — generated \`.base\` view files. **Never hand-edit**.
 - \`05_Attachments/\` — downloaded images and video posters (\`<post-id>-<n>.<ext>\`).
 - \`00 Dashboard.md\` — created once, yours to edit afterwards.
@@ -51,12 +56,12 @@ the importer owns \`data/bookmarks.db\` and rewrites notes from it.
 | \`handle\`, \`author\` | importer | Author handle (\`@name\`) and display name. |
 | \`published\` | importer | Post creation date (\`YYYY-MM-DD\`). |
 | \`added\` | importer | When the importer first saw this bookmark. X exposes no bookmark timestamp, so this is an import date, not a save date. |
-| \`lang\` | importer | Detected language. |
+| \`lang\` | importer | Detected language, omitted when X reports \`zxx\`/\`und\`. |
 | \`kind\` | importer | \`post\`, \`quote\`, \`retweet\`, \`reply\` or \`article\`. |
 | \`thread\`, \`quoted\`, \`article\` | importer | Related URLs, when present. |
 | \`media\` | importer | Attachment types (\`image\`, \`video\`, \`animated_gif\`). |
 | \`status\` | **you** | \`inbox\` → \`kept\` or \`dropped\`. Set once at import, never touched again. |
-| \`topics\` | **you** | Free-form list. This is what makes the vault searchable by subject. |
+| \`topics\` | **you** | Lowercase slugs, 1–2 per note. This is what makes the vault searchable by subject. |
 | \`summary\` | **you** | Optional one-liner. |
 
 ## Rules
@@ -65,26 +70,36 @@ the importer owns \`data/bookmarks.db\` and rewrites notes from it.
   preserves the body of any note you have edited.
 - Do not add \`#tags\`; use the \`topics\` property so Bases can filter on it.
 - Do not delete \`05_Attachments/\` files by hand — the database will still reference them.
-- Moving a note to \`Library/\` or renaming it is safe: the importer finds notes by \`id\`, not path.
+- Moving or renaming a note is safe: the importer finds notes by \`id\`, not path.
+- Long-form X Articles keep their full body under \`## Full article\`, so a note can be thousands of
+  words. Search and graph views will pick that up.
 `;
 
-export function writeVaultDocs(config: Config): { created: string[]; skipped: string[] } {
+export function writeVaultDocs(
+  config: Config,
+  options: { overwrite?: boolean } = {},
+): { created: string[]; skipped: string[]; overwritten: string[] } {
   const created: string[] = [];
   const skipped: string[] = [];
+  const overwritten: string[] = [];
 
-  const dashboard = join(config.vaultPath, '00 Dashboard.md');
-  if (existsSync(dashboard)) skipped.push('00 Dashboard.md');
-  else {
-    writeFileAtomic(dashboard, DASHBOARD_NOTE);
-    created.push('00 Dashboard.md');
+  for (const [relative, content] of [
+    ['00 Dashboard.md', DASHBOARD_NOTE],
+    ['AGENTS.md', AGENTS_NOTE],
+  ] as const) {
+    const target = join(config.vaultPath, relative);
+    if (existsSync(target)) {
+      if (!options.overwrite) {
+        skipped.push(relative);
+        continue;
+      }
+      writeFileAtomic(target, content);
+      overwritten.push(relative);
+      continue;
+    }
+    writeFileAtomic(target, content);
+    created.push(relative);
   }
 
-  const agents = join(config.vaultPath, 'AGENTS.md');
-  if (existsSync(agents)) skipped.push('AGENTS.md');
-  else {
-    writeFileAtomic(agents, AGENTS_NOTE);
-    created.push('AGENTS.md');
-  }
-
-  return { created, skipped };
+  return { created, skipped, overwritten };
 }

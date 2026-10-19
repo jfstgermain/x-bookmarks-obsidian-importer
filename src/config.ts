@@ -31,6 +31,12 @@ export type Config = {
   attachmentsDir: string;
   /** Vault-relative folder for generated per-author index notes. */
   authorsDir: string;
+  /**
+   * Only generate an author index note for authors with at least this many saved posts.
+   * One-post authors stay as plain @handle text in the footer, which keeps the graph and
+   * the Authors/ folder signal-heavy instead of spawning a file per drive-by account.
+   */
+  authorIndexMinPosts: number;
   /** Vault-relative folder for generated .base view files. */
   basesDir: string;
   /** Posts per API page (1-100). */
@@ -55,6 +61,7 @@ const DEFAULTS: Omit<Config, 'vaultPath'> = {
   libraryDir: 'Library',
   attachmentsDir: '05_Attachments',
   authorsDir: 'Authors',
+  authorIndexMinPosts: 2,
   basesDir: 'Bases',
   maxResults: 100,
   downloadMedia: true,

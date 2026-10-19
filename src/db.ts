@@ -40,7 +40,18 @@ export type PostRow = {
   quoteCount: number;
   articleUrl: string | null;
   articleTitle: string | null;
+  articlePreview: string | null;
+  articleText: string | null;
+  links: LinkRow[];
   media: MediaRow[];
+};
+
+export type LinkRow = {
+  url: string | null;
+  expanded: string;
+  display: string | null;
+  title: string | null;
+  description: string | null;
 };
 
 const SCHEMA = `
@@ -87,6 +98,9 @@ CREATE TABLE IF NOT EXISTS posts (
   quote_count       INTEGER DEFAULT 0,
   article_url       TEXT,
   article_title     TEXT,
+  article_preview   TEXT,
+  article_text      TEXT,
+  links_json        TEXT,
   media_count       INTEGER DEFAULT 0,
   first_seen_at     TEXT NOT NULL,
   last_seen_at      TEXT NOT NULL,
@@ -136,7 +150,18 @@ export function openDb(file: string): DatabaseSync {
   if (!existsSync(dirname(file))) mkdirSync(dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
   db.exec(SCHEMA);
+  // Columns added after the first release; existing databases get them in place.
+  ensureColumn(db, 'posts', 'article_preview', 'TEXT');
+  ensureColumn(db, 'posts', 'article_text', 'TEXT');
+  ensureColumn(db, 'posts', 'links_json', 'TEXT');
   return db;
+}
+
+function ensureColumn(db: DatabaseSync, table: string, column: string, type: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((entry) => entry.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
 }
 
 export function nowIso(): string {
@@ -193,14 +218,15 @@ INSERT INTO posts (
   id, url, author_id, author_name, handle, text, note_text, full_text, created_at, lang,
   conversation_id, in_reply_to_user_id, ref_type, quoted_id, quoted_handle, quoted_name,
   quoted_text, quoted_created_at, like_count, retweet_count, reply_count, quote_count,
-  article_url, article_title, media_count, first_seen_at, last_seen_at, last_seen_run,
+  article_url, article_title, article_preview, article_text, links_json, media_count,
+  first_seen_at, last_seen_at, last_seen_run,
   raw_json, dirty
 ) VALUES (
   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
   ?, ?, ?, ?, ?, ?,
   ?, ?, ?, ?, ?, ?,
   ?, ?, ?, ?, ?, ?,
-  ?, 1
+  ?, ?, ?, ?, 1
 )
 ON CONFLICT (id) DO UPDATE SET
   url               = excluded.url,
@@ -226,6 +252,9 @@ ON CONFLICT (id) DO UPDATE SET
   quote_count       = excluded.quote_count,
   article_url       = COALESCE(excluded.article_url, posts.article_url),
   article_title     = COALESCE(excluded.article_title, posts.article_title),
+  article_preview   = COALESCE(excluded.article_preview, posts.article_preview),
+  article_text      = COALESCE(excluded.article_text, posts.article_text),
+  links_json        = COALESCE(excluded.links_json, posts.links_json),
   media_count       = excluded.media_count,
   last_seen_at      = excluded.last_seen_at,
   last_seen_run     = excluded.last_seen_run,
@@ -270,6 +299,9 @@ export function upsertPost(
     post.quoteCount,
     post.articleUrl,
     post.articleTitle,
+    post.articlePreview,
+    post.articleText,
+    post.links.length > 0 ? JSON.stringify(post.links) : null,
     post.media.length,
     now,
     now,
@@ -464,6 +496,17 @@ export function vanishedCount(db: DatabaseSync): number {
         .get(lastComplete.id) as { n: number }
     ).n ?? 0,
   );
+}
+
+/**
+ * Handles that deserve a generated index note, i.e. authors you saved from more than once.
+ * Derived from the database so the note writer and the index generator always agree.
+ */
+export function qualifyingHandles(db: DatabaseSync, minPosts: number): Set<string> {
+  const rows = db
+    .prepare('SELECT handle, COUNT(*) AS n FROM posts WHERE handle IS NOT NULL GROUP BY handle')
+    .all() as Array<{ handle: string; n: number }>;
+  return new Set(rows.filter((row) => Number(row.n) >= minPosts).map((row) => row.handle));
 }
 
 export function estimatedCostUsd(resources: number): number {

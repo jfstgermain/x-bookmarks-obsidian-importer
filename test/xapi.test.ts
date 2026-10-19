@@ -187,6 +187,90 @@ test('missing author expansion falls back to the post username', () => {
   }
 });
 
+test('a native X Article keeps its full body, title and canonical url', () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const run = startRun(db);
+    const page: BookmarksPage = {
+      data: [
+        {
+          id: '777',
+          text: 'https://t.co/abc',
+          author_id: '42',
+          entities: {
+            urls: [
+              {
+                url: 'https://t.co/abc',
+                expanded_url: 'https://x.com/i/article/777000',
+                unwound_url: 'https://x.com/i/article/777000',
+                display_url: 'x.com/i/article/777…',
+              },
+            ],
+          },
+          article: {
+            title: 'Harness Engineering',
+            preview_text: 'A short preview of the article.',
+            plain_text: 'The full article body that would otherwise be lost.',
+          },
+          article_title: { title: 'Harness Engineering' },
+        },
+      ],
+      includes: { users: [{ id: '42', name: 'J', username: 'j' }] },
+    };
+    ingestPage(db, page, modern, run);
+    const row = db.prepare('SELECT * FROM posts WHERE id = ?').get('777') as Record<string, unknown>;
+    assert.equal(row.article_title, 'Harness Engineering');
+    assert.equal(row.article_text, 'The full article body that would otherwise be lost.');
+    assert.equal(row.article_preview, 'A short preview of the article.');
+    assert.equal(row.article_url, 'https://x.com/i/article/777000');
+  } finally {
+    cleanup();
+  }
+});
+
+test('link entities are kept with their expanded target and title', () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const run = startRun(db);
+    ingestPage(
+      db,
+      {
+        data: [
+          {
+            id: '888',
+            text: 'great read https://t.co/zzz',
+            author_id: '42',
+            entities: {
+              urls: [
+                {
+                  url: 'https://t.co/zzz',
+                  expanded_url: 'https://example.com/post',
+                  unwound_url: 'https://example.com/post?ref=x',
+                  display_url: 'example.com/post',
+                  title: 'A useful post',
+                  description: 'About things',
+                },
+              ],
+            },
+          },
+        ],
+        includes: { users: [{ id: '42', name: 'J', username: 'j' }] },
+      },
+      modern,
+      run,
+    );
+    const row = db.prepare('SELECT links_json FROM posts WHERE id = ?').get('888') as {
+      links_json: string;
+    };
+    const links = JSON.parse(row.links_json) as Array<Record<string, string>>;
+    assert.equal(links.length, 1);
+    assert.equal(links[0]!.expanded, 'https://example.com/post?ref=x', 'prefers the unwound url');
+    assert.equal(links[0]!.title, 'A useful post');
+  } finally {
+    cleanup();
+  }
+});
+
 test('an empty bookmark list is a no-op', () => {
   const { db, cleanup } = tempDb();
   try {

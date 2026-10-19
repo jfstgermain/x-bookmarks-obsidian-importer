@@ -131,6 +131,55 @@ test('article posts are labelled as articles', () => {
   assert.match(note.body, /\*\*Linked article:\*\* Long read/);
 });
 
+test('a full article body is preserved under its own heading', () => {
+  const note = buildNote(
+    makePost({
+      full_text: 'https://t.co/abc',
+      article_url: 'https://x.com/i/article/777',
+      article_title: 'Harness Engineering',
+      article_preview: 'A short preview of the article.',
+      article_text: 'The full article body that would otherwise be lost.',
+    }),
+    [],
+    { addedDate: '2026-10-18' },
+  );
+  assert.match(note.body, /## Full article/);
+  assert.match(note.body, /\*\*Harness Engineering\*\*/);
+  assert.match(note.body, /The full article body that would otherwise be lost\./);
+  assert.match(note.body, /A short preview of the article\./, 'preview leads the note');
+  assert.equal(note.body.includes('https://t.co/abc'), false, 'bare link stub dropped when the article exists');
+  assert.match(note.body, /## Full article[\s\S]*## My notes/, 'user section stays last');
+});
+
+test('shared links render with their titles instead of dead t.co urls', () => {
+  const note = buildNote(
+    makePost({
+      full_text: 'great read https://t.co/zzz',
+      links_json: JSON.stringify([
+        { expanded: 'https://example.com/post', display: 'example.com/post', title: 'A useful post', description: null, url: null },
+        { expanded: 'https://x.com/i/article/777', display: 'x.com/i/article', title: 'Harness', description: null, url: null },
+      ]),
+    }),
+    [],
+    { addedDate: '2026-10-18' },
+  );
+  assert.match(note.body, /\*\*Links\*\*\n- \[A useful post\]\(https:\/\/example\.com\/post\)/);
+  assert.equal(note.body.includes('x.com/i/article/777'), false, 'article links are not repeated in the link list');
+});
+
+test('links without a title fall back to the hostname', () => {
+  const note = buildNote(
+    makePost({
+      links_json: JSON.stringify([
+        { expanded: 'https://www.example.org/page', display: null, title: null, description: null, url: null },
+      ]),
+    }),
+    [],
+    { addedDate: '2026-10-18' },
+  );
+  assert.match(note.body, /- \[example\.org\]\(https:\/\/www\.example\.org\/page\)/);
+});
+
 test('notes always end with a user-owned section', () => {
   const note = buildNote(makePost(), [], { addedDate: '2026-10-18' });
   assert.match(note.body, /## My notes\n\n$/);

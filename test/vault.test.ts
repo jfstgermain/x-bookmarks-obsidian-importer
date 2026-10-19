@@ -1,10 +1,19 @@
 import { strict as assert } from 'node:assert';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { DEFAULTS, type Config } from '../src/config.ts';
-import { openDb, startRun, upsertPost, type PostRow } from '../src/db.ts';
+import { openDb, qualifyingHandles, startRun, upsertPost, type PostRow } from '../src/db.ts';
 import { splitFrontmatter } from '../src/frontmatter.ts';
 import { renderAll } from '../src/render.ts';
 import { buildAuthorNotes, writeBases } from '../src/views.ts';
@@ -51,6 +60,9 @@ function post(overrides: Partial<PostRow> = {}): PostRow {
     quoteCount: 0,
     articleUrl: null,
     articleTitle: null,
+    articlePreview: null,
+    articleText: null,
+    links: [],
     media: [],
     ...overrides,
   };
@@ -92,7 +104,12 @@ test('first render creates one note in Inbox with the expected schema', () => {
     assert.equal(frontmatter?.published, '2026-03-14');
     assert.equal(frontmatter?.handle, '@janedoe');
     assert.match(body, /Reliability beats cleverness/);
-    assert.match(body, /\[\[@janedoe\]\]/, 'author is wikilinked for the graph');
+    assert.match(
+      body,
+      /· @janedoe · imported/,
+      'single-post author stays plain text — no index note exists to link to',
+    );
+    assert.equal(body.includes('[[@janedoe]]'), false, 'no ghost wikilink');
   } finally {
     cleanup();
   }
@@ -212,12 +229,78 @@ test('generated author indexes list the saved posts', () => {
     );
     renderAll(db, config);
 
-    const summary = buildAuthorNotes(config);
+    const summary = buildAuthorNotes(config, qualifyingHandles(db, config.authorIndexMinPosts));
     assert.equal(summary.authors, 1);
     const moc = readFileSync(join(vaultPath, 'Authors', '@janedoe.md'), 'utf8');
     assert.match(moc, /# @janedoe/);
     assert.match(moc, /2 saved posts/);
     assert.match(moc, /Reliability beats cleverness/);
+  } finally {
+    cleanup();
+  }
+});
+
+test('authors below the index threshold get no file and no wikilink', () => {
+  const { vaultPath, db, config, cleanup } = setup();
+  try {
+    const run = startRun(db);
+    // One post from @janedoe, one from @other: neither reaches the default threshold of 2.
+    upsertPost(db, post(), {}, run);
+    upsertPost(
+      db,
+      post({ id: '333', url: 'https://x.com/other/status/333', handle: '@other', authorName: 'Other' }),
+      {},
+      run,
+    );
+    renderAll(db, config);
+
+    const handles = qualifyingHandles(db, config.authorIndexMinPosts);
+    assert.equal(handles.size, 0);
+
+    const summary = buildAuthorNotes(config, handles);
+    assert.equal(summary.notes, 0);
+    const authorsDir = join(vaultPath, 'Authors');
+    assert.equal(
+      existsSync(authorsDir) ? readdirSync(authorsDir).length : 0,
+      0,
+      'no index files created',
+    );
+
+    const body = readFileSync(
+      join(vaultPath, 'Inbox', '2026-03-14 - @janedoe - Reliability beats cleverness.md'),
+      'utf8',
+    );
+    assert.equal(body.includes('[['), false, 'no wikilinks at all in the body');
+  } finally {
+    cleanup();
+  }
+});
+
+test('an author gaining a second post earns a wikilink and an index', () => {
+  const { vaultPath, db, config, cleanup } = setup();
+  try {
+    const run = startRun(db);
+    upsertPost(db, post(), {}, run);
+    renderAll(db, config);
+
+    upsertPost(
+      db,
+      post({ id: '222', url: 'https://x.com/janedoe/status/222', fullText: 'Second post' }),
+      {},
+      run,
+    );
+    renderAll(db, config);
+
+    const rendered = readdirSync(join(vaultPath, 'Inbox')).map((name) =>
+      readFileSync(join(vaultPath, 'Inbox', name), 'utf8'),
+    );
+    assert.ok(
+      rendered.some((content) => content.includes('[[@janedoe]]')),
+      'the newly rendered note links to the author index',
+    );
+
+    const summary = buildAuthorNotes(config, qualifyingHandles(db, config.authorIndexMinPosts));
+    assert.equal(summary.notes, 1);
   } finally {
     cleanup();
   }

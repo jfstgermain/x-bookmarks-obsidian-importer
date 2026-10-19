@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import type { DatabaseSync } from 'node:sqlite';
 import { authorise, ensureAccount } from './auth.ts';
 import {
   DEFAULTS,
+  absolutePath,
   ensureDataDirs,
   ensureVaultLayout,
   loadConfig,
@@ -18,6 +20,7 @@ import {
   finishRun,
   getMeta,
   openDb,
+  qualifyingHandles,
   setMeta,
   startRun,
   stats,
@@ -26,9 +29,11 @@ import {
 import { log, setVerbose } from './log.ts';
 import { downloadAllMedia, pendingMediaCount } from './media.ts';
 import { buildVaultIndex, renderAll } from './render.ts';
+import { applyPlan, buildDigest, describeApply, readPlan } from './triage.ts';
 import { buildAuthorNotes, writeBases } from './views.ts';
+import { writeFileAtomic } from './vault-io.ts';
 import { writeVaultDocs } from './vault-docs.ts';
-import { XApi, syncBookmarks } from './xapi.ts';
+import { XApi, reingestRaw, syncBookmarks } from './xapi.ts';
 
 const USAGE = `x-bookmarks-obsidian-importer
 
@@ -42,6 +47,9 @@ Commands:
   render    Write/refresh Obsidian notes from the database
   views     Regenerate .base views and per-author index notes
   all       sync + render + views
+  digest    Print a compact JSON digest of notes awaiting triage
+  triage    Apply a topic/status plan and file notes into Library/<year>/
+  reingest  Replay archived API pages (free) and re-render notes
   status    Show what has been imported
 
 Global options:
@@ -67,6 +75,17 @@ sync options:
 render options:
   --limit <n>        Only render n pending notes (triage a backlog in batches)
   --force            Overwrite note bodies even if you edited them
+
+digest options:
+  --folder <name>    Folder to digest (default: Inbox)
+  --status <name>    Only include notes with this status
+  --limit <n>        Cap the number of entries
+
+triage options:
+  --plan <file>      JSON plan: [{ "id": "...", "topics": ["..."] }, ...]
+  --into <target>    'library' files triaged notes into Library/<year>/
+  --status <name>    Status to stamp (default: kept)
+  --dry-run          Report what would change without writing
 `;
 
 type Args = { command: string; flags: Map<string, string | true> };
@@ -133,11 +152,13 @@ async function main(): Promise<void> {
       const config = { ...DEFAULTS, ...(existing ?? {}), vaultPath } as Config;
       ensureVaultLayout(config);
       saveConfig(config);
-      const docs = writeVaultDocs(config);
+      const docs = writeVaultDocs(config, { overwrite: flagOn(args, 'force') });
       const bases = writeBases(config);
       log.ok(`vault configured: ${config.vaultPath}`);
       log.step(`config file: ${paths().configFile}`);
       if (docs.created.length) log.step(`created ${docs.created.join(', ')}`);
+      if (docs.overwritten.length) log.step(`rewrote ${docs.overwritten.join(', ')}`);
+      if (docs.skipped.length) log.step(`kept existing ${docs.skipped.join(', ')} (use --force to rewrite)`);
       if (bases.length) log.step(`wrote ${bases.length} base views to ${config.basesDir}/`);
       log.info('\nNext: create an X app (OAuth 2.0, public client, callback');
       log.info('http://localhost:8787/callback), then run:');
@@ -187,7 +208,7 @@ async function main(): Promise<void> {
     case 'views': {
       const config = configFrom(args);
       ensureVaultLayout(config);
-      log.ok(formatViews(config));
+      log.ok(formatViews(config, openDb(ensureDataDirs().dbFile)));
       return;
     }
 
@@ -197,7 +218,65 @@ async function main(): Promise<void> {
       const db = openDb(ensureDataDirs().dbFile);
       const summary = renderAll(db, config, { limit: flagNumber(args, 'limit') });
       log.ok(`render: ${summary.created} created · ${summary.updated} updated`);
-      log.ok(formatViews(config));
+      log.ok(formatViews(config, db));
+      return;
+    }
+
+    case 'digest': {
+      const config = configFrom(args);
+      ensureVaultLayout(config);
+      const entries = buildDigest(config, {
+        folder: flagString(args, 'folder') ?? config.inboxDir,
+        status: flagString(args, 'status'),
+        limit: flagNumber(args, 'limit'),
+      });
+      const json = JSON.stringify(entries, null, 2);
+      const out = flagString(args, 'out');
+      if (out) {
+        writeFileAtomic(absolutePath(out), `${json}\n`);
+        log.ok(`digest: ${entries.length} notes → ${absolutePath(out)}`);
+      } else {
+        log.info(json);
+      }
+      return;
+    }
+
+    case 'triage': {
+      const config = configFrom(args);
+      ensureVaultLayout(config);
+      const planFile = flagString(args, 'plan');
+      if (!planFile) throw new Error('Pass --plan <file.json>');
+      const plan = readPlan(absolutePath(planFile));
+      const db = openDb(ensureDataDirs().dbFile);
+      const statusFlag = flagString(args, 'status') ?? 'kept';
+      const summary = applyPlan(config, db, plan, {
+        status: statusFlag === 'none' ? null : (statusFlag as 'kept' | 'dropped'),
+        into: flagString(args, 'into') === 'library' ? 'library' : null,
+        dryRun: flagOn(args, 'dry-run'),
+      });
+      const verb = flagOn(args, 'dry-run') ? 'dry run' : 'triage';
+      log.ok(`${verb}: ${describeApply(summary, flagOn(args, 'dry-run'))}`);
+      if (summary.unknownIds.length) {
+        log.warn(`ids not found in the vault: ${summary.unknownIds.slice(0, 5).join(', ')}`);
+      }
+      return;
+    }
+
+    case 'reingest': {
+      const config = configFrom(args);
+      ensureVaultLayout(config);
+      const dataPaths = ensureDataDirs();
+      const db = openDb(dataPaths.dbFile);
+      const replay = reingestRaw(db, dataPaths.rawDir);
+      if (replay.pages === 0) {
+        log.warn(`no archived pages in ${dataPaths.rawDir}`);
+        return;
+      }
+      log.ok(`reingest: ${replay.posts} posts from ${replay.pages} archived page(s) — no API cost`);
+      const summary = renderAll(db, config, {});
+      log.ok(
+        `render: ${summary.created} created · ${summary.updated} updated · ${summary.bodyPreserved} kept your edits · ${summary.errors} errors`,
+      );
       return;
     }
 
@@ -212,10 +291,12 @@ async function main(): Promise<void> {
   }
 }
 
-function formatViews(config: Config): string {
+function formatViews(config: Config, db: DatabaseSync): string {
   const bases = writeBases(config);
-  const authors = buildAuthorNotes(config);
-  return `views: ${bases.length} bases · ${authors.notes} author notes (${authors.removed} pruned)`;
+  const handles = qualifyingHandles(db, config.authorIndexMinPosts);
+  const authors = buildAuthorNotes(config, handles);
+  const skipped = authors.skipped > 0 ? ` · ${authors.skipped} authors below ${config.authorIndexMinPosts} posts` : '';
+  return `views: ${bases.length} bases · ${authors.notes} author notes (${authors.removed} pruned${skipped})`;
 }
 
 async function runSync(args: Args): Promise<void> {

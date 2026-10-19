@@ -66,9 +66,23 @@ properties:
     displayName: Author
   published:
     displayName: Posted
+  added:
+    displayName: Saved
   formula.year:
     displayName: Year
 views:
+  - type: table
+    name: "Recent"
+    limit: 25
+    order:
+      - file.name
+      - handle
+      - published
+      - added
+      - topics
+    sort:
+      - property: added
+        direction: DESC
   - type: table
     name: "Library"
     order:
@@ -186,10 +200,14 @@ function excerpt(body: string): string {
   return '';
 }
 
-export type AuthorIndexSummary = { authors: number; notes: number; removed: number };
+export type AuthorIndexSummary = { authors: number; notes: number; removed: number; skipped: number };
 
-/** Generate one index note per author, plus prune stale generated ones. */
-export function buildAuthorNotes(config: Config): AuthorIndexSummary {
+/**
+ * Generate one index note per author, plus prune stale generated ones.
+ * `handles` is the set that deserves an index (see qualifyingHandles): authors below the
+ * threshold get no file, and their notes link to them as plain text instead.
+ */
+export function buildAuthorNotes(config: Config, handles: Set<string>): AuthorIndexSummary {
   const index = buildVaultIndex(config.vaultPath, [config.inboxDir, config.libraryDir]);
 
   type Entry = {
@@ -203,6 +221,7 @@ export function buildAuthorNotes(config: Config): AuthorIndexSummary {
   for (const entry of index.values()) {
     const handle = entry.frontmatter?.handle;
     if (!handle) continue;
+    if (!handles.has(String(handle))) continue;
     const list = byHandle.get(String(handle)) ?? [];
     list.push({
       path: entry.path,
@@ -273,5 +292,5 @@ export function buildAuthorNotes(config: Config): AuthorIndexSummary {
     }
   }
 
-  return { authors: byHandle.size, notes, removed };
+  return { authors: byHandle.size, notes, removed, skipped: handles.size - byHandle.size };
 }

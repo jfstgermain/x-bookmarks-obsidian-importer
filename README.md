@@ -92,12 +92,15 @@ Then open the `X` vault in Obsidian and start at `00 Dashboard.md`.
 
 | Command | What it does |
 |---|---|
-| `init --vault <path>` | Save config, create the vault skeleton, write `.base` views |
+| `init --vault <path>` | Save config, create the vault skeleton, write `.base` views. `--force` also rewrites `00 Dashboard.md` and `AGENTS.md` |
 | `auth --client-id <id>` | OAuth 2.0 PKCE authorisation; stores refreshable tokens |
 | `doctor` | Node version, vault, scopes, credential refresh, API reachability |
 | `sync` | Fetch bookmarks → SQLite → `data/raw/`, then download media. Add `--since last` for a cheap top-up |
 | `render` | Database → markdown notes (only notes marked dirty) |
-| `views` | Regenerate `Bases/*.base` and `Authors/@handle.md` |
+| `views` | Regenerate `Bases/*.base` and `Authors/@handle.md` (authors above `authorIndexMinPosts`) |
+| `digest` | Print a compact JSON digest (id, excerpt, current topics) of notes awaiting triage |
+| `triage --plan <file> --into library` | Apply topics/status from a JSON plan and file notes into `Library/<year>/` |
+| `reingest` | Replay `data/raw/*.json` through the ingester and re-render — **free**, no API calls |
 | `all` | `sync` + `render` + `views` |
 | `status` | Counts, estimated spend, last sync, triage breakdown |
 
@@ -159,13 +162,18 @@ returns no bookmark timestamp. It is named `added` rather than `saved` for that 
 
 Folders are deliberately shallow; everything expressive happens through properties and Bases.
 
+- `Library/<year>/` — where triaged notes live. `Bases/Library.base` gives you *Recent* (last 25 by
+  import date), *Library* (grouped by year) and *Dropped*.
 - `Inbox/` — untriaged. `Bases/Inbox.base` gives you a 10-item reading queue (oldest first) plus a
-  full untriaged table sorted by recency.
-- `Library/` — where you move notes after triage. `Bases/Library.base` groups by year.
-- `Authors/@handle.md` — generated index of everything you ever saved from that account. Every note
-  links to its author index, so the graph clusters by source.
+  full untriaged table sorted by recency. Empty once you have triaged a batch.
+- `Authors/@handle.md` — generated index of everything you saved from that account, but only for
+  authors you saved from **more than once** (`authorIndexMinPosts`, default 2). Single-post authors
+  are plain text in the note footer instead of a wikilink, so neither the folder nor the graph fills
+  up with one-off files. On a 97-bookmark vault this is 87 accounts → 6 index notes.
 - `05_Attachments/` — downloaded images and video posters, named `<post-id>-<n>.<ext>` so the vault
   survives the post being deleted.
+- `00 Dashboard.md` — Recent, Library, Authors, Topics, and the triage queue, all as embedded Bases.
+  Rewrite it with `init --vault <path> --force`.
 - `AGENTS.md` — the schema contract, if you point an AI agent at this vault.
 
 Triage loop: open the dashboard → read the queue → add `topics`, set `status: kept`, add notes under
@@ -252,6 +260,42 @@ node src/cli.ts all --since last   # daily, ~$0.10
 node src/cli.ts all                # weekly full refresh, ~$2 per 2k bookmarks
 ```
 
+## Triaging at scale
+
+Tagging 97 bookmarks by hand is an hour of clicking. The importer exposes a two-step loop that
+lets a script or an AI session do the reading while you keep the decision:
+
+```bash
+# 1. Get a compact digest of everything untriaged
+node src/cli.ts digest --out /tmp/digest.json
+
+# 2. Write a plan: [{ "id": "...", "topics": ["ai-agents", "finance"] }, ...]
+node src/cli.ts triage --plan plan.json --into library --status kept --dry-run
+node src/cli.ts triage --plan plan.json --into library --status kept
+```
+
+Notes are matched by `id`, so a plan can be re-run safely, applied to notes already in `Library/`,
+and will never touch a note it does not recognise (unknown ids are reported, not guessed at).
+`--into library` moves each note to `Library/<published year>/`.
+
+Keep plan files in `data/triage-plans/` — they are the record of *why* a note is tagged the way
+it is, which is worth more than the tags themselves once the vault is large.
+
+## What the ingester extracts
+
+| Source field | Lands in the note as |
+|---|---|
+| `note_post.text` | the full long-post body (not the truncated `text`) |
+| `article.plain_text` | `## Full article` — the complete body of native X Articles, 8k–30k chars |
+| `article.preview_text` | an opening paragraph, so link-only posts still read |
+| `entities.urls` | `**Links**` — expanded URLs with their titles, instead of dead `t.co` stubs |
+| `referenced_posts` | an inline quote/retweet callout |
+| `attachments.media_keys` | downloaded images / video posters under `05_Attachments/` |
+
+Because every API page is archived verbatim in `data/raw/`, new extraction logic can be applied
+retroactively with `reingest` at zero cost — that is how the article bodies above were recovered
+after the first import had already dropped them.
+
 ## Project layout
 
 ```
@@ -261,12 +305,14 @@ src/
   xapi.ts         API client, pagination, field-profile fallback, page ingestion
   db.ts           SQLite schema, dedupe, provenance, run bookkeeping
   render.ts       note building + idempotent vault writer
+  triage.ts       digest generation + topic/status plan application
   frontmatter.ts  Obsidian-safe YAML encoding and merge rules
   media.ts        media downloads
   views.ts        .base views + per-author indexes
   vault-docs.ts   dashboard and AGENTS.md templates
-test/             44 tests: YAML encoding, merge rules, note rendering,
-                  dedupe, media mapping, and an end-to-end run against a mock API
+test/             61 tests: YAML encoding, merge rules, note rendering,
+                  article/link extraction, dedupe, media mapping, triage plans,
+                  and an end-to-end run against a mock API
 ```
 
 ```bash
