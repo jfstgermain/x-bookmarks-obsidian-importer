@@ -49,7 +49,8 @@ OAuth 2.0 token you can revoke from your X account at any time.
    - **Callback URI:** `http://localhost:8787/callback`
    - **Website URL:** anything valid, e.g. `https://github.com/`
 3. Copy the **OAuth 2.0 Client ID** from *Keys and tokens*.
-4. Add credits to your developer account (pay-per-use). $5 covers a 5,000-bookmark import.
+4. Add credits to your developer account. Credits are **prepaid** — a zero balance returns
+   `402 Payment Required` on the first call. About $1 per 1,000 bookmarked posts.
 
 ### 2. Install and configure
 
@@ -94,14 +95,14 @@ Then open the `X` vault in Obsidian and start at `00 Dashboard.md`.
 | `init --vault <path>` | Save config, create the vault skeleton, write `.base` views |
 | `auth --client-id <id>` | OAuth 2.0 PKCE authorisation; stores refreshable tokens |
 | `doctor` | Node version, vault, scopes, credential refresh, API reachability |
-| `sync` | Fetch bookmarks → SQLite → `data/raw/`, then download media |
+| `sync` | Fetch bookmarks → SQLite → `data/raw/`, then download media. Add `--since last` for a cheap top-up |
 | `render` | Database → markdown notes (only notes marked dirty) |
 | `views` | Regenerate `Bases/*.base` and `Authors/@handle.md` |
 | `all` | `sync` + `render` + `views` |
 | `status` | Counts, estimated spend, last sync, triage breakdown |
 
-Useful flags: `--limit <n>`, `--max-pages <n>`, `--no-media`, `--force`, `--verbose`,
-`--vault <path>`.
+Useful flags: `--since <post-id>|last`, `--limit <n>`, `--max-pages <n>`, `--no-media`, `--force`,
+`--verbose`, `--vault <path>`.
 
 Triaging a large backlog in batches:
 
@@ -171,11 +172,40 @@ Triage loop: open the dashboard → read the queue → add `topics`, set `status
 `## My notes`, move the file to `Library/YYYY/`. The importer follows the note by `id`, so moving it
 never breaks anything.
 
+## Incremental syncs (`--since`)
+
+X bills per post **returned**, not per post that is new to you. Re-reading a 2,000-bookmark list
+every day costs ~$2/day even when nothing changed. `--since` fixes that.
+
+The bookmark list is ordered **newest-bookmarked first**, so once you reach a post you already have,
+everything below it is already imported. The importer stops there.
+
+```bash
+# Daily top-up: stop at the topmost post of the previous run
+node src/cli.ts all --since last
+
+# Stop at a specific post id (from a note's `id:` property or its URL)
+node src/cli.ts sync --since 1801234567890123456
+```
+
+- `--since last` uses a watermark the importer saves after every run (visible in `status` as
+  *incremental watermark*).
+- If the watermark post was unbookmarked or deleted, it never appears and the run quietly falls back
+  to reading the whole list, with a warning.
+- An incremental run stops early, so it is recorded as **partial**. That is deliberate: it cannot
+  prove a bookmark was removed, so `status` keeps reporting the last complete scan's view.
+- Run a full `sync` occasionally (weekly is plenty) to refresh completeness tracking and pick up
+  engagement-count changes on older bookmarks.
+
 ## Costs and rate limits
 
-- **$0.001 per post returned** (Owned Read). `status` tracks cumulative estimated spend.
+- **$0.001 per post returned** (Owned Read), prepaid in credits at `console.x.com`.
+- A full 2,000-bookmark scan is ~$2. A `--since last` daily top-up is ~$0.10 (one page).
+- `status` tracks cumulative estimated spend.
 - 180 requests / 15 minutes per user, 100 posts per page. The client waits out `429`s using
   `x-rate-limit-reset` and retries `5xx` with exponential backoff.
+- The field-name profile that worked is remembered, so incremental runs make a single request
+  instead of probing the modern names first.
 - Use `--max-pages` / `--limit` to cap a run. `--no-media` skips the CDN downloads.
 
 ## Reliability details worth knowing
@@ -203,7 +233,7 @@ never breaks anything.
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>cd $HOME/dev/x-bookmarks-obsidian-importer &amp;&amp; node src/cli.ts all >> data/sync.log 2>&1</string>
+    <string>cd $HOME/dev/x-bookmarks-obsidian-importer &amp;&amp; node src/cli.ts all --since last >> data/sync.log 2>&1</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
@@ -215,6 +245,11 @@ never breaks anything.
 
 ```bash
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jfstgermain.x-bookmarks.plist
+```
+
+```bash
+node src/cli.ts all --since last   # daily, ~$0.10
+node src/cli.ts all                # weekly full refresh, ~$2 per 2k bookmarks
 ```
 
 ## Project layout

@@ -419,7 +419,13 @@ export type Stats = {
   dirty: number;
   mediaFiles: number;
   firstSeen: string | null;
-  lastSync: { started_at: string; posts_seen: number; posts_new: number; complete: number } | null;
+  lastSync: {
+    started_at: string;
+    posts_seen: number;
+    posts_new: number;
+    complete: number;
+    error: string | null;
+  } | null;
   runs: number;
 };
 
@@ -427,7 +433,7 @@ export function stats(db: DatabaseSync): Stats {
   const one = (sql: string): number => Number((db.prepare(sql).get() as { n: number }).n ?? 0);
   const lastSync = db
     .prepare(
-      `SELECT started_at, posts_seen, posts_new, complete
+      `SELECT started_at, posts_seen, posts_new, complete, error
          FROM sync_runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1`,
     )
     .get() as Stats['lastSync'];

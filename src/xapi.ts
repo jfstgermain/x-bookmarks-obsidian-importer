@@ -134,6 +134,27 @@ export class XApiError extends Error {
   }
 }
 
+/**
+ * 402 from X means the developer account has no credits left. It is a billing
+ * problem, not a configuration problem, and the API's own message says nothing
+ * useful about how to fix it.
+ */
+export class CreditsDepletedError extends Error {
+  constructor() {
+    super(
+      [
+        'X API credits depleted — the importer is configured correctly, it just cannot pay for reads.',
+        '',
+        '  Top up at:  https://console.x.com  →  Billing / Credits',
+        '  Cost model: $0.001 per bookmarked post returned (~$1 per 1,000 posts)',
+        '',
+        'Credits are prepaid: a zero balance fails the first request, there is no post-paid billing.',
+      ].join('\n'),
+    );
+    this.name = 'CreditsDepletedError';
+  }
+}
+
 export type BookmarksPage = {
   data?: Array<Record<string, unknown>>;
   includes?: {
@@ -215,6 +236,10 @@ export class XApi {
       }
 
       const text = await response.text();
+
+      if (response.status === 402) {
+        throw new CreditsDepletedError();
+      }
 
       if (response.status === 400) {
         const lower = text.toLowerCase();
@@ -425,6 +450,17 @@ export type SyncOptions = {
   maxResults?: number;
   maxPages?: number;
   limit?: number;
+  /**
+   * Stop paginating once this post id shows up in a page. Because the bookmark list is
+   * ordered newest-bookmarked-first, everything below a known post is already imported,
+   * so this turns a full re-read of the list into a one-page top-up.
+   */
+  since?: string;
+  /**
+   * Profile name that worked last time. Probing the modern field names on every run costs an
+   * extra round-trip (the API rejects them with a 400), so we remember the winner and start there.
+   */
+  preferredProfile?: string;
   onPage?: (info: { page: number; seen: number; total: number }) => void;
 };
 
@@ -436,6 +472,10 @@ export type SyncResult = {
   fieldProfile: string;
   costUsd: number;
   stoppedEarly: boolean;
+  /** True when the `--since` post was actually encountered before stopping. */
+  sinceFound: boolean;
+  /** Topmost post id of this run, used as the next run's cheap watermark. */
+  firstPostId: string | null;
 };
 
 /**
@@ -449,13 +489,23 @@ export async function syncBookmarks(
   runId: number,
   options: SyncOptions,
 ): Promise<SyncResult> {
-  let profileIndex = 0;
+  // Try the remembered profile first, then everything else as a fallback chain.
+  const profileOrder: number[] = [];
+  const preferredIndex = FIELD_PROFILES.findIndex((p) => p.name === options.preferredProfile);
+  if (preferredIndex >= 0) profileOrder.push(preferredIndex);
+  for (let i = 0; i < FIELD_PROFILES.length; i += 1) {
+    if (!profileOrder.includes(i)) profileOrder.push(i);
+  }
+
+  let attempt = 0;
   let paginationToken: string | undefined;
   let pages = 0;
   let postsSeen = 0;
   let postsNew = 0;
   let stoppedEarly = false;
   let complete = false;
+  let sinceFound = false;
+  let firstPostId: string | null = null;
 
   for (;;) {
     if (options.maxPages && pages >= options.maxPages) {
@@ -465,23 +515,22 @@ export async function syncBookmarks(
 
     let page: BookmarksPage;
     try {
-      page = await api.bookmarks(options.userId, FIELD_PROFILES[profileIndex]!, {
+      page = await api.bookmarks(options.userId, FIELD_PROFILES[profileOrder[attempt]!]!, {
         maxResults: options.maxResults ?? 100,
         paginationToken,
       });
     } catch (error) {
-      if (error instanceof FieldProfileError && profileIndex + 1 < FIELD_PROFILES.length) {
-        const next = FIELD_PROFILES[profileIndex + 1]!;
-        log.warn(
-          `${FIELD_PROFILES[profileIndex]!.name} field names rejected by the API; retrying with ${next.name} names`,
-        );
-        profileIndex += 1;
+      if (error instanceof FieldProfileError && attempt + 1 < profileOrder.length) {
+        const rejected = FIELD_PROFILES[profileOrder[attempt]!]!;
+        attempt += 1;
+        const next = FIELD_PROFILES[profileOrder[attempt]!]!;
+        log.warn(`${rejected.name} field names rejected by the API; retrying with ${next.name} names`);
         continue;
       }
       throw error;
     }
 
-    const profile = FIELD_PROFILES[profileIndex]!;
+    const profile = FIELD_PROFILES[profileOrder[attempt]!]!;
     pages += 1;
     saveRawPage(options.rawDir, runId, pages, page);
 
@@ -490,8 +539,22 @@ export async function syncBookmarks(
     postsNew += ingested.created;
     options.onPage?.({ page: pages, seen: postsSeen, total: postsSeen });
 
+    if (firstPostId === null && page.data && page.data.length > 0) {
+      firstPostId = String(page.data[0]!.id ?? '') || null;
+    }
+
     if (options.limit && postsSeen >= options.limit) {
       stoppedEarly = true;
+      break;
+    }
+
+    const hasNextPage = Boolean(page.meta?.next_token);
+
+    if (options.since && (page.data ?? []).some((post) => String(post.id) === options.since)) {
+      sinceFound = true;
+      // Reaching the watermark on the final page means we did in fact read everything.
+      if (hasNextPage) stoppedEarly = true;
+      else complete = true;
       break;
     }
 
@@ -507,9 +570,11 @@ export async function syncBookmarks(
     postsSeen,
     postsNew,
     complete,
-    fieldProfile: FIELD_PROFILES[profileIndex]!.name,
+    fieldProfile: FIELD_PROFILES[profileOrder[attempt]!]!.name,
     costUsd: estimatedCostUsd(postsSeen),
     stoppedEarly,
+    sinceFound,
+    firstPostId,
   };
 }
 
