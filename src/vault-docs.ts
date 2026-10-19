@@ -64,6 +64,22 @@ the importer owns \`data/bookmarks.db\` and rewrites notes from it.
 | \`topics\` | **you** | Lowercase slugs, 1–2 per note. This is what makes the vault searchable by subject. |
 | \`summary\` | **you** | Optional one-liner. |
 
+## Triaging
+
+Triaging (status + topics) is driven by the **x-bookmarks-triage skill**, which encodes the procedure
+and the controlled vocabulary in ~/dev/x-bookmarks-obsidian-importer/TOPICS.md. Load the skill; do
+not improvise a taxonomy. If the skill is unavailable, the loop is:
+
+    cd ~/dev/x-bookmarks-obsidian-importer
+    node src/cli.ts digest --out /tmp/digest.json                 # compact view of the backlog
+    node src/cli.ts triage --plan plan.json --status kept --into library --dry-run
+    node src/cli.ts triage --plan plan.json --status kept --into library
+    node src/cli.ts views
+
+Rules that matter from inside the vault: topics come only from TOPICS.md (1-2 per note), status
+only moves inbox -> kept/dropped, unsorted is reserved for notes with no readable content, and never
+edit a body the importer generated.
+
 ## Rules
 
 - Add your thinking under \`## My notes\`. The importer replaces only the generated section and

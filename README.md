@@ -260,10 +260,28 @@ node src/cli.ts all --since last   # daily, ~$0.10
 node src/cli.ts all                # weekly full refresh, ~$2 per 2k bookmarks
 ```
 
-## Triaging at scale
+## Triaging with a model
 
-Tagging 97 bookmarks by hand is an hour of clicking. The importer exposes a two-step loop that
-lets a script or an AI session do the reading while you keep the decision:
+Tagging is the only part a script cannot do, so it is packaged as a skill rather than left as an
+undocumented ritual:
+
+```
+skills/x-bookmarks-triage/SKILL.md   # the procedure a model follows
+TOPICS.md                            # the controlled vocabulary it must tag from
+```
+
+The skill is registered in `~/.pi/agent/settings.json`. Ask for it directly (`/skill:x-bookmarks-triage`)
+or just ask to "triage my new bookmarks" — the description routes it. It encodes the procedure
+(digest → plan → dry-run → apply → views → report), the hard rules (never invent a tag, never edit a
+note body, never drop without instruction, always dry-run), and the `unsorted` fallback policy.
+
+`TOPICS.md` is what makes tags consistent across sessions and across models: a tag used twice is
+useful, a tag invented per-run is noise. Adding a topic is a deliberate change to that file, not an
+improvisation mid-batch.
+
+## Triaging by hand
+
+Still works, and the same primitives:
 
 ```bash
 # 1. Get a compact digest of everything untriaged
