@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   getValidAccessToken,
@@ -10,6 +10,7 @@ import { log } from './log.ts';
 import {
   estimatedCostUsd,
   nowIso,
+  type LinkRow,
   type MediaRow,
   type PostRow,
   upsertAuthor,
@@ -393,6 +394,39 @@ export function ingestPage(
 
     const metrics = (post.public_metrics ?? {}) as Record<string, unknown>;
     const article = post.article as Record<string, unknown> | undefined;
+
+    const entities = (post.entities ?? {}) as Record<string, unknown>;
+    const rawUrls = Array.isArray(entities.urls)
+      ? (entities.urls as Array<Record<string, unknown>>)
+      : [];
+    const links: LinkRow[] = rawUrls
+      .map((link) => ({
+        url: link.url ? String(link.url) : null,
+        expanded: String(link.unwound_url ?? link.expanded_url ?? link.url ?? ''),
+        display: link.display_url ? String(link.display_url) : null,
+        title: link.title ? String(link.title) : null,
+        description: link.description ? String(link.description) : null,
+      }))
+      .filter((link) => link.expanded.length > 0);
+
+    // Native X Articles expose no `url` on the article object; the canonical link
+    // only shows up in entities.urls as https://x.com/i/article/<id>.
+    const articleUrl =
+      (article?.url ? String(article.url) : null) ??
+      links.find((link) => /\/i\/article\//.test(link.expanded))?.expanded ??
+      null;
+
+    const titleCandidate = article?.title ?? post.article_title;
+    const articleTitle =
+      typeof titleCandidate === 'string'
+        ? titleCandidate
+        : titleCandidate && typeof titleCandidate === 'object'
+          ? String((titleCandidate as { title?: unknown }).title ?? '') || null
+          : null;
+
+    const articleText = article?.plain_text ? String(article.plain_text) : null;
+    const articlePreview = article?.preview_text ? String(article.preview_text) : null;
+
     const createdAt =
       (post.created_at as string | undefined) ?? dateFromPostId(id)?.toISOString() ?? null;
 
@@ -419,12 +453,11 @@ export function ingestPage(
       retweetCount: num(metrics.retweet_count),
       replyCount: num(metrics.reply_count),
       quoteCount: num(metrics.quote_count),
-      articleUrl: article?.url ? String(article.url) : null,
-      articleTitle: article?.title
-        ? String(article.title)
-        : post.article_title
-          ? String(post.article_title)
-          : null,
+      articleUrl,
+      articleTitle,
+      articlePreview,
+      articleText,
+      links,
       media,
     };
 
@@ -442,6 +475,48 @@ export function saveRawPage(rawDir: string, runId: number, pageNumber: number, p
   const file = join(rawDir, `${String(runId).padStart(4, '0')}-page-${String(pageNumber).padStart(3, '0')}.json`);
   writeFileSync(file, `${JSON.stringify(page, null, 2)}\n`, 'utf8');
   return file;
+}
+
+function guessProfile(page: BookmarksPage): FieldProfile {
+  const sample = (page.data ?? [])[0] ?? {};
+  const modernish =
+    'note_post' in sample || 'referenced_posts' in sample || 'username' in sample;
+  return modernish ? FIELD_PROFILES[0]! : FIELD_PROFILES[1]!;
+}
+
+/**
+ * Replay archived API pages through the ingester without spending anything.
+ * Use this after the ingester learns to extract more from a response (articles,
+ * link entities, media): the raw JSON already holds the data.
+ */
+export function reingestRaw(
+  db: DatabaseSync,
+  rawDir: string,
+): { pages: number; posts: number; files: string[] } {
+  if (!existsSync(rawDir)) return { pages: 0, posts: 0, files: [] };
+
+  const files = readdirSync(rawDir)
+    .filter((name) => name.endsWith('.json'))
+    .sort((a, b) => a.localeCompare(b));
+
+  let pages = 0;
+  let posts = 0;
+
+  for (const name of files) {
+    const runId = Number(name.split('-')[0]);
+    let page: BookmarksPage;
+    try {
+      page = JSON.parse(readFileSync(join(rawDir, name), 'utf8')) as BookmarksPage;
+    } catch {
+      log.warn(`skipping unreadable archive ${name}`);
+      continue;
+    }
+    const result = ingestPage(db, page, guessProfile(page), Number.isFinite(runId) ? runId : 0);
+    pages += 1;
+    posts += result.seen;
+  }
+
+  return { pages, posts, files };
 }
 
 export type SyncOptions = {

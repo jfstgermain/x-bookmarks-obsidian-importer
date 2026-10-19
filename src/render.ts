@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { Config } from './config.ts';
-import { dirtyPosts, mediaForPost, markRendered, type RawPost } from './db.ts';
+import { dirtyPosts, mediaForPost, markRendered, qualifyingHandles, type RawPost } from './db.ts';
 import {
   composeNote,
   mergeFrontmatter,
@@ -48,6 +48,37 @@ export type MediaFile = {
   alt_text: string | null;
 };
 
+type NoteLink = {
+  expanded: string;
+  display: string | null;
+  title: string | null;
+  description: string | null;
+};
+
+function parseLinks(raw: unknown): NoteLink[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(String(raw)) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (link): link is NoteLink =>
+        Boolean(link) && typeof link === 'object' && typeof (link as NoteLink).expanded === 'string',
+    );
+  } catch {
+    return [];
+  }
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return url;
+  }
+}
+
+const BARE_URL = /^https?:\/\/\S+$/;
+
 export type BuiltNote = { filename: string; frontmatter: Frontmatter; body: string };
 
 function day(value: unknown): string {
@@ -92,7 +123,11 @@ function mediaBlock(post: RawPost, media: MediaFile[]): string {
   return parts.join('\n\n');
 }
 
-export function buildNote(post: RawPost, media: MediaFile[], options: { addedDate: string }): BuiltNote {
+export function buildNote(
+  post: RawPost,
+  media: MediaFile[],
+  options: { addedDate: string; mocHandles?: Set<string> },
+): BuiltNote {
   const id = String(post.id);
   const handle = normaliseHandle((post.handle as string | undefined) ?? undefined);
   const author = (post.author_name as string | undefined) ?? handle;
@@ -109,6 +144,9 @@ export function buildNote(post: RawPost, media: MediaFile[], options: { addedDat
     conversationId && conversationId !== id ? postUrl(handle, conversationId) : null;
   const articleUrl = post.article_url ? String(post.article_url) : null;
   const articleTitle = post.article_title ? String(post.article_title) : null;
+  const articleText = post.article_text ? String(post.article_text) : null;
+  const articlePreview = post.article_preview ? String(post.article_preview) : null;
+  const links = parseLinks(post.links_json);
 
   const kind = articleUrl
     ? 'article'
@@ -131,7 +169,10 @@ export function buildNote(post: RawPost, media: MediaFile[], options: { addedDat
   };
   // Only emit optional keys when they carry a value, so notes stay clean and
   // `'thread' in frontmatter` reliably means "this post is part of a thread".
-  if (post.lang) frontmatter.lang = String(post.lang);
+  // `zxx` (no linguistic content) and `und` (undetermined) show up for link-only and
+  // media-only posts; they are noise in a property list.
+  const lang = post.lang ? String(post.lang) : '';
+  if (lang && lang !== 'zxx' && lang !== 'und') frontmatter.lang = lang;
   if (threadUrl) frontmatter.thread = threadUrl;
   if (quotedUrl) frontmatter.quoted = quotedUrl;
   if (articleUrl) frontmatter.article = articleUrl;
@@ -152,7 +193,11 @@ export function buildNote(post: RawPost, media: MediaFile[], options: { addedDat
     );
     if (fullText && !fullText.startsWith('RT @')) sections.push(fullText);
   } else {
-    sections.push(fullText);
+    // A post whose entire text is a bare t.co link carries no information: when we have the
+    // article it points at, drop the stub and lead with the preview instead.
+    const textIsBareLink = BARE_URL.test(fullText.trim());
+    if (!(textIsBareLink && (articlePreview || articleText))) sections.push(fullText);
+    if (articlePreview) sections.push(articlePreview);
     if (kind === 'quote' && post.quoted_text) {
       sections.push(
         callout(
@@ -173,16 +218,33 @@ export function buildNote(post: RawPost, media: MediaFile[], options: { addedDat
     );
   }
 
+  const externalLinks = links.filter((link) => !/\/i\/article\//.test(link.expanded));
+  if (externalLinks.length > 0) {
+    const items = externalLinks.map((link) => {
+      const label = link.title?.trim() || hostOf(link.expanded);
+      return `- [${label.replace(/[[\]]/g, '')}](${link.expanded})`;
+    });
+    sections.push(`**Links**\n${items.join('\n')}`);
+  }
+
   const footerBits = [`[View on X](${url})`];
   if (threadUrl) footerBits.push(`[Thread](${threadUrl})`);
-  footerBits.push(`[[${normaliseHandle(String(post.handle ?? ''))}]]`);
+  const authorHandle = normaliseHandle(String(post.handle ?? ''));
+  // Link to the author's index only when one exists, otherwise Obsidian shows a ghost node.
+  if (!options.mocHandles || options.mocHandles.has(authorHandle)) {
+    footerBits.push(`[[${authorHandle}]]`);
+  } else {
+    footerBits.push(authorHandle);
+  }
   footerBits.push(`imported ${options.addedDate}`);
   sections.push(`---\n${footerBits.join(' · ')}`);
 
   const body = `${sections
     .map((section) => section.trim())
     .filter(Boolean)
-    .join('\n\n')}\n\n## My notes\n\n`;
+    .join('\n\n')}${
+    articleText ? `\n\n## Full article\n\n${articleTitle ? `**${articleTitle}**\n\n` : ''}${articleText.trim()}` : ''
+  }\n\n## My notes\n\n`;
 
   const title = titleFromText(fullText || String(post.quoted_text ?? '')) || `post ${id}`;
   const filename = sanitiseTitle(`${published || 'undated'} - ${handle} - ${title}`);
@@ -262,13 +324,14 @@ export function renderAll(
     config.libraryDir,
     config.authorsDir,
   ]);
+  const mocHandles = qualifyingHandles(db, config.authorIndexMinPosts);
 
   for (const post of posts) {
     try {
       const id = String(post.id);
       const media = mediaForPost(db, id) as unknown as MediaFile[];
       const addedDate = day(post.first_seen_at ?? new Date().toISOString());
-      const note = buildNote(post, media, { addedDate });
+      const note = buildNote(post, media, { addedDate, mocHandles });
 
       const existing = index.get(id);
       const generatedBody = note.body;

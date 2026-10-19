@@ -48,6 +48,9 @@ function post(overrides: Partial<PostRow> = {}): PostRow {
     quoteCount: 0,
     articleUrl: null,
     articleTitle: null,
+    articlePreview: null,
+    articleText: null,
+    links: [],
     media: [],
     ...overrides,
   };
