@@ -58,6 +58,8 @@ auth options:
   --port <n>         Local callback port (default 8787)
 
 sync options:
+  --since <post-id>  Stop once this post id appears (use 'last' for the watermark from the
+                     previous run). Turns a full re-read into a one-page top-up.
   --limit <n>        Stop after n posts
   --max-pages <n>    Stop after n API pages (100 posts each)
   --no-media         Skip media downloads for this run
@@ -229,6 +231,19 @@ async function runSync(args: Args): Promise<void> {
   const runId = startRun(db);
   setMeta(db, 'account_username', account.username);
 
+  // `--since last` resolves to the topmost post of the previous run: a watermark that is
+  // guaranteed to sit in bookmark order, so we can stop as soon as we reach it.
+  const sinceFlag = flagString(args, 'since');
+  let since = sinceFlag;
+  if (sinceFlag === 'last') {
+    since = getMeta(db, 'frontier_id') ?? undefined;
+    if (!since) {
+      log.warn('no watermark recorded yet (first run) — reading the full bookmark list');
+    } else {
+      log.step(`incremental: stopping at known post ${since}`);
+    }
+  }
+
   log.step(`syncing bookmarks for @${account.username}`);
 
   let result;
@@ -239,6 +254,8 @@ async function runSync(args: Args): Promise<void> {
       maxResults: config.maxResults,
       maxPages: flagNumber(args, 'max-pages'),
       limit: flagNumber(args, 'limit'),
+      since,
+      preferredProfile: getMeta(db, 'field_profile') ?? undefined,
       onPage: (info) =>
         log.step(
           `page ${info.page} · ${info.seen} posts seen · est. $${estimatedCostUsd(info.seen).toFixed(4)}`,
@@ -267,10 +284,23 @@ async function runSync(args: Args): Promise<void> {
     `sync: ${result.postsSeen} posts in ${result.pages} page(s) · ${result.postsNew} new · ${result.fieldProfile} field names · est. $${result.costUsd.toFixed(4)}`,
   );
   if (!result.complete) {
-    log.warn(
-      'scan stopped before the end of the bookmark list — "no longer bookmarked" tracking stays off',
-    );
+    if (since && result.sinceFound) {
+      log.step(
+        `stopped at --since ${since} after ${result.pages} page(s) — everything below it was already imported`,
+      );
+    } else if (since) {
+      log.warn(`--since ${since} never appeared; the full bookmark list was read instead`);
+    } else {
+      log.warn(
+        'scan stopped before the end of the bookmark list — "no longer bookmarked" tracking stays off',
+      );
+    }
   }
+
+  // Remember the topmost post for the next `--since last` run.
+  if (result.firstPostId) setMeta(db, 'frontier_id', result.firstPostId);
+  // Remember which field-name profile the API accepted, so later runs skip the probe.
+  setMeta(db, 'field_profile', result.fieldProfile);
 
   const previousTotal = Number(getMeta(db, 'est_cost_total_usd') ?? '0');
   setMeta(db, 'est_cost_total_usd', (previousTotal + result.costUsd).toFixed(4));
@@ -379,10 +409,16 @@ function runStatus(): void {
     log.info(
       `  last sync             ${summary.lastSync.started_at} · ${summary.lastSync.posts_seen} seen / ${summary.lastSync.posts_new} new${partial}`,
     );
+    if (summary.lastSync.error) {
+      const firstLine = summary.lastSync.error.split('\n')[0] ?? summary.lastSync.error;
+      log.info(`                        failed: ${firstLine}`);
+    }
     const gone = vanishedCount(db);
     if (gone > 0) log.info(`  no longer bookmarked  ${gone}`);
   }
   log.info(`  database              ${dataPaths.dbFile}`);
+  const frontier = getMeta(db, 'frontier_id');
+  if (frontier) log.info(`  incremental watermark   ${frontier}`);
 
   if (config && existsSync(config.vaultPath)) {
     const index = buildVaultIndex(config.vaultPath, [config.inboxDir, config.libraryDir]);

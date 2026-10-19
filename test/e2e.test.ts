@@ -174,6 +174,155 @@ test('end-to-end: fallback, paginate, ingest, render, re-sync', async () => {
   }
 });
 
+test('a 402 is reported as a billing problem, not a config problem', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        detail: 'credits depleted',
+        status: 402,
+        title: 'Payment Required',
+        type: 'https://api.x.com/2/problems/credits-depleted',
+      }),
+      { status: 402, headers: { 'content-type': 'application/json' } },
+    )) as typeof fetch;
+
+  try {
+    const api = new XApi(credentials);
+    await assert.rejects(
+      () => api.get('/2/users/42/bookmarks', {}),
+      (error: Error) => {
+        assert.equal(error.name, 'CreditsDepletedError');
+        assert.match(error.message, /console\.x\.com/);
+        assert.match(error.message, /\$0\.001 per bookmarked post/);
+        assert.match(error.message, /no post-paid billing/);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('--since stops as soon as the watermark post appears', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'xbm-since-'));
+  const db = openDb(join(root, 'db.sqlite'));
+  const state = { calls: [] as string[] };
+  const restore = installFetchMock(state);
+
+  try {
+    const runId = startRun(db);
+    const api = new XApi(credentials);
+    const result = await syncBookmarks(db, api, runId, {
+      rawDir: join(root, 'raw'),
+      userId: '42',
+      since: '102',
+      preferredProfile: 'legacy',
+    });
+
+    assert.equal(result.pages, 1, 'stopped on the page containing the watermark');
+    assert.equal(result.sinceFound, true);
+    assert.equal(result.stoppedEarly, true);
+    assert.equal(result.complete, false, 'an incremental run never claims completeness');
+    assert.equal(result.firstPostId, '101');
+    assert.equal(
+      state.calls.filter((c) => c.includes('bookmarks')).length,
+      1,
+      'a remembered field profile means one request, one page paid for',
+    );
+  } finally {
+    restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('--since on the final page still counts as a complete read', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'xbm-since-last-'));
+  const db = openDb(join(root, 'db.sqlite'));
+  const state = { calls: [] as string[] };
+  const restore = installFetchMock(state);
+
+  try {
+    const runId = startRun(db);
+    const api = new XApi(credentials);
+    const result = await syncBookmarks(db, api, runId, {
+      rawDir: join(root, 'raw'),
+      userId: '42',
+      since: '103',
+    });
+
+    assert.equal(result.pages, 2);
+    assert.equal(result.sinceFound, true);
+    assert.equal(result.stoppedEarly, false);
+    assert.equal(result.complete, true, 'reaching the watermark on the last page read everything');
+  } finally {
+    restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a --since id that no longer exists falls back to a full read', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'xbm-since-missing-'));
+  const db = openDb(join(root, 'db.sqlite'));
+  const state = { calls: [] as string[] };
+  const restore = installFetchMock(state);
+
+  try {
+    const runId = startRun(db);
+    const api = new XApi(credentials);
+    const result = await syncBookmarks(db, api, runId, {
+      rawDir: join(root, 'raw'),
+      userId: '42',
+      since: '999999',
+    });
+
+    assert.equal(result.pages, 2, 'kept going when the watermark was absent');
+    assert.equal(result.sinceFound, false);
+    assert.equal(result.complete, true);
+  } finally {
+    restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the remembered field profile is used first, with fallback still intact', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'xbm-profile-'));
+  const db = openDb(join(root, 'db.sqlite'));
+  const state = { calls: [] as string[] };
+  const restore = installFetchMock(state);
+
+  try {
+    const api = new XApi(credentials);
+
+    // First run: no memory, so it probes the modern names and falls back.
+    const first = await syncBookmarks(db, api, startRun(db), {
+      rawDir: join(root, 'raw'),
+      userId: '42',
+    });
+    assert.equal(first.fieldProfile, 'legacy');
+    const firstCalls = state.calls.length;
+    assert.equal(firstCalls, 3, '2 pages + 1 rejected probe');
+
+    // Second run with the remembered profile: no wasted probe.
+    state.calls.length = 0;
+    const second = await syncBookmarks(db, api, startRun(db), {
+      rawDir: join(root, 'raw'),
+      userId: '42',
+      preferredProfile: first.fieldProfile,
+    });
+    assert.equal(second.fieldProfile, 'legacy');
+    assert.equal(state.calls.length, 2, 'no probe, just the two pages');
+    assert.equal(
+      state.calls.some((call) => call.includes('post.fields')),
+      false,
+      'never asked for the modern names again',
+    );
+  } finally {
+    restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a partial run does not claim completeness', async () => {
   const root = mkdtempSync(join(tmpdir(), 'xbm-e2e-partial-'));
   const db = openDb(join(root, 'db.sqlite'));
