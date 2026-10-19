@@ -1,0 +1,8 @@
+node_modules/
+data/
+*.log
+.env
+.DS_Store
+
+# Never commit credentials — they live outside the repo by default, but belt and braces
+credentials.json

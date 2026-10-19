@@ -1,0 +1,29 @@
+{
+  "name": "x-bookmarks-obsidian-importer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Import X (Twitter) bookmarks into a dedicated Obsidian vault via the official X API v2, with SQLite provenance and idempotent re-rendering.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "auth": "node src/cli.ts auth",
+    "init": "node src/cli.ts init",
+    "status": "node src/cli.ts status",
+    "doctor": "node src/cli.ts doctor",
+    "sync": "node src/cli.ts sync",
+    "render": "node src/cli.ts render",
+    "views": "node src/cli.ts views",
+    "sync:all": "node src/cli.ts all",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
